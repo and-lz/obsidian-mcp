@@ -11,6 +11,10 @@ import { createCreateNoteTool, TOOL_NAME as CREATE_NOTE } from "./create-note/in
 import { createDeleteNoteTool, TOOL_NAME as DELETE_NOTE } from "./delete-note/index.js";
 import { createEditNoteTool, TOOL_NAME as EDIT_NOTE } from "./edit-note/index.js";
 import { createListVaultsTool, TOOL_NAME as LIST_VAULTS } from "./list-vaults/index.js";
+import {
+  createManageBookmarksTool,
+  TOOL_NAME as MANAGE_BOOKMARKS
+} from "./manage-bookmarks/index.js";
 import { createManageTagsTool, TOOL_NAME as MANAGE_TAGS } from "./manage-tags/index.js";
 import { createMoveNoteTool, TOOL_NAME as MOVE_NOTE } from "./move-note/index.js";
 import { createReadNoteTool, TOOL_NAME as READ_NOTE } from "./read-note/index.js";
@@ -30,7 +34,8 @@ export const TOOL_NAMES = [
   ADD_TAGS,
   REMOVE_TAGS,
   RENAME_TAG,
-  MANAGE_TAGS
+  MANAGE_TAGS,
+  MANAGE_BOOKMARKS
 ] as const;
 
 export function createToolDefinitions(runtime: Runtime) {
@@ -46,7 +51,8 @@ export function createToolDefinitions(runtime: Runtime) {
     createAddTagsTool(runtime),
     createRemoveTagsTool(runtime),
     createRenameTagTool(runtime),
-    createManageTagsTool(runtime)
+    createManageTagsTool(runtime),
+    createManageBookmarksTool(runtime)
   ] as const;
 }
 
@@ -64,4 +70,5 @@ export function registerTools(server: McpServer, runtime: Runtime): void {
   registerTool(server, definitions[9]);
   registerTool(server, definitions[10]);
   registerTool(server, definitions[11]);
+  registerTool(server, definitions[12]);
 }
