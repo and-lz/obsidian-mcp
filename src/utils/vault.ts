@@ -252,6 +252,41 @@ export class VaultFs {
     return { relativePath: normalized, absolutePath };
   }
 
+  /**
+   * Resolves the fixed Obsidian Bookmarks config file. This is the only path under the reserved
+   * `.obsidian` root that tools may touch; it is a constant, never derived from tool input.
+   */
+  async resolveBookmarksFile(): Promise<VaultEntry & { exists: boolean }> {
+    const configDirectory = path.join(this.vault.root, ".obsidian");
+    const absolutePath = path.join(configDirectory, "bookmarks.json");
+    await this.assertComponentsSafe(absolutePath, false);
+    let directory;
+    try {
+      directory = await fs.lstat(configDirectory);
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") {
+        throw new ToolFailure(
+          "NOTE_NOT_FOUND",
+          "The vault has no .obsidian directory; bookmarks need an Obsidian vault root."
+        );
+      }
+      throw asToolFailure(error, "inspect the Obsidian configuration");
+    }
+    if (!directory.isDirectory()) {
+      throw new ToolFailure("PATH_REJECTED", "The .obsidian entry is not a directory.");
+    }
+    let exists = true;
+    try {
+      await fs.lstat(absolutePath);
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== "ENOENT") {
+        throw asToolFailure(error, "inspect the bookmarks file");
+      }
+      exists = false;
+    }
+    return { relativePath: ".obsidian/bookmarks.json", absolutePath, exists };
+  }
+
   async exists(relativePath: string, options: { markdown?: boolean } = {}): Promise<boolean> {
     try {
       await this.resolveExisting(relativePath, options);

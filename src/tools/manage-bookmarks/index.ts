@@ -1,21 +1,35 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
-
+import type { ToolAnnotations } from "@modelcontextprotocol/server";
 import * as z from "zod";
 
 import type { Runtime } from "../../runtime.js";
 import type { ToolDefinition } from "../../types.js";
-import { isNodeError, ToolFailure } from "../../utils/errors.js";
+import { ToolFailure } from "../../utils/errors.js";
 import {
+  etagSchema,
   nullableTransactionIdSchema,
+  outputEtagSchema,
   outputPathSchema,
   relativePathSchema,
   vaultSchema
 } from "../../utils/schemas.js";
-import { MUTATE } from "../../utils/tool-factory.js";
+import { assertIfMatch } from "../../utils/validation.js";
 import { sha256 } from "../../utils/vault.js";
 
 export const TOOL_NAME = "obsidian_manage_bookmarks";
+
+const MAX_BOOKMARK_ITEMS = 10_000;
+const MAX_GROUP_DEPTH = 32;
+
+const BOOKMARKS: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false
+};
+
+const ifMatchSchema = etagSchema.optional().meta({
+  description: "Optional revision guard for .obsidian/bookmarks.json returned by a previous call"
+});
 
 const inputSchema = z.discriminatedUnion("operation", [
   z
@@ -31,7 +45,8 @@ const inputSchema = z.discriminatedUnion("operation", [
       path: relativePathSchema.meta({
         description: "Vault-relative path of the note to bookmark",
         examples: ["Projects/Plan.md"]
-      })
+      }),
+      if_match: ifMatchSchema
     })
     .strict(),
   z
@@ -41,7 +56,8 @@ const inputSchema = z.discriminatedUnion("operation", [
       path: relativePathSchema.meta({
         description: "Vault-relative path of the note to unbookmark",
         examples: ["Projects/Plan.md"]
-      })
+      }),
+      if_match: ifMatchSchema
     })
     .strict()
 ]);
@@ -55,16 +71,15 @@ const outputSchema = z
     bookmarks: z.array(outputPathSchema).meta({
       description: "Bookmarked note paths after the operation, in file order"
     }),
+    etag: outputEtagSchema.nullable().meta({
+      description:
+        "SHA-256 revision of bookmarks.json after the operation, or null if it does not exist"
+    }),
     transaction_id: nullableTransactionIdSchema
   })
   .strict();
 
-interface BookmarkItem {
-  type?: unknown;
-  path?: unknown;
-  items?: unknown;
-  [key: string]: unknown;
-}
+type BookmarkItem = Record<string, unknown>;
 
 interface BookmarksFile {
   items: BookmarkItem[];
@@ -78,87 +93,84 @@ export function createManageBookmarksTool(
     name: TOOL_NAME,
     title: "Manage Obsidian Bookmarks",
     description:
-      "List, add, or remove Obsidian bookmarks (favorites) for notes by editing the core Bookmarks plugin file transactionally. Requires the vault to be an Obsidian vault with a .obsidian directory.",
+      "List, add, or remove Obsidian bookmarks (favorites) for notes by transactionally editing the core Bookmarks plugin file .obsidian/bookmarks.json, the only file under .obsidian that tools can touch. Requires an Obsidian vault root.",
     inputSchema,
     outputSchema,
-    annotations: MUTATE,
+    annotations: BOOKMARKS,
     execute: async (input) => {
       const service = runtime.forVault(input.vault);
-      const target = path.join(service.vault.root, ".obsidian", "bookmarks.json");
-      const current = await readBookmarks(target);
+      const target = await service.fs.resolveBookmarksFile();
+      const current = target.exists ? await service.fs.readText(target) : undefined;
+      const file = current === undefined ? { items: [] } : parseBookmarks(current.text);
+      const bookmarks = collectPaths(file.items);
 
       if (input.operation === "list") {
         return {
           operation: "list",
           changed: false,
-          bookmarks: collectPaths(current.file.items),
+          bookmarks,
+          etag: current?.etag ?? null,
           transaction_id: null
         };
       }
 
+      if (current === undefined) {
+        if (input.if_match !== undefined) {
+          throw new ToolFailure(
+            "REVISION_CONFLICT",
+            "The bookmarks file does not exist, so the revision cannot match. Retry without if_match.",
+            { retryable: true }
+          );
+        }
+      } else {
+        assertIfMatch(input.if_match, current.etag);
+      }
+
       const note = await service.fs.resolveExisting(input.path, { markdown: true });
-      const present = collectPaths(current.file.items).includes(note.relativePath);
+      const present = bookmarks.includes(note.relativePath);
       if (input.operation === "add" ? present : !present) {
         return {
           operation: input.operation,
           changed: false,
-          bookmarks: collectPaths(current.file.items),
+          bookmarks,
+          etag: current?.etag ?? null,
           transaction_id: null
         };
       }
 
-      const file = structuredClone(current.file);
+      const next = structuredClone(file);
       if (input.operation === "add") {
-        file.items.push({ type: "file", ctime: Date.now(), path: note.relativePath, title: "" });
+        if (bookmarks.length >= MAX_BOOKMARK_ITEMS) {
+          throw new ToolFailure("INPUT_TOO_LARGE", "The bookmarks file has too many entries.");
+        }
+        next.items.push({ type: "file", ctime: Date.now(), path: note.relativePath, title: "" });
       } else {
-        removePath(file.items, note.relativePath);
+        removePath(next.items, note.relativePath);
       }
+      const data = Buffer.from(`${JSON.stringify(next, null, 2)}\n`, "utf8");
       const transactionId = await service.transactions.run([
         {
           kind: "write",
-          path: target,
-          data: Buffer.from(`${JSON.stringify(file, null, 2)}\n`, "utf8"),
-          ...(current.raw === undefined
-            ? { requireMissing: true }
-            : { expectedEtag: sha256(current.raw) })
+          path: target.absolutePath,
+          data,
+          ...(current === undefined ? { requireMissing: true } : { expectedEtag: current.etag })
         }
       ]);
       return {
         operation: input.operation,
         changed: true,
-        bookmarks: collectPaths(file.items),
+        bookmarks: collectPaths(next.items),
+        etag: sha256(data),
         transaction_id: transactionId
       };
     }
   };
 }
 
-async function readBookmarks(
-  target: string
-): Promise<{ file: BookmarksFile; raw: Buffer | undefined }> {
-  const configDirectory = path.dirname(target);
-  try {
-    if (!(await fs.stat(configDirectory)).isDirectory()) throw new Error("not a directory");
-  } catch {
-    throw new ToolFailure(
-      "NOTE_NOT_FOUND",
-      "The vault has no .obsidian directory; bookmarks need an Obsidian vault root."
-    );
-  }
-  let raw: Buffer;
-  try {
-    raw = await fs.readFile(target);
-  } catch (error) {
-    if (isNodeError(error) && error.code === "ENOENT") {
-      return { file: { items: [] }, raw: undefined };
-    }
-    throw new ToolFailure("FILESYSTEM_ERROR", "Could not read .obsidian/bookmarks.json.", {
-      cause: error
-    });
-  }
+function parseBookmarks(text: string): BookmarksFile {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw.toString("utf8"));
+    parsed = JSON.parse(text);
   } catch (error) {
     throw new ToolFailure("INVALID_ARGUMENT", ".obsidian/bookmarks.json is not valid JSON.", {
       cause: error
@@ -167,6 +179,7 @@ async function readBookmarks(
   if (
     typeof parsed !== "object" ||
     parsed === null ||
+    Array.isArray(parsed) ||
     !("items" in parsed) ||
     !Array.isArray(parsed.items)
   ) {
@@ -175,28 +188,56 @@ async function readBookmarks(
       ".obsidian/bookmarks.json does not have the expected { items: [] } shape."
     );
   }
-  return { file: parsed as BookmarksFile, raw };
+  const file = parsed as BookmarksFile;
+  assertWithinLimits(file.items);
+  return file;
 }
 
-function collectPaths(items: readonly BookmarkItem[]): string[] {
+function assertWithinLimits(items: readonly unknown[]): void {
+  let count = 0;
+  const visit = (list: readonly unknown[], depth: number): void => {
+    if (depth > MAX_GROUP_DEPTH) {
+      throw new ToolFailure("INVALID_ARGUMENT", "Bookmark groups are nested too deeply.");
+    }
+    for (const item of list) {
+      count += 1;
+      if (count > MAX_BOOKMARK_ITEMS) {
+        throw new ToolFailure("INPUT_TOO_LARGE", "The bookmarks file has too many entries.");
+      }
+      const children = groupItems(item);
+      if (children !== undefined) visit(children, depth + 1);
+    }
+  };
+  visit(items, 1);
+}
+
+function groupItems(item: unknown): readonly unknown[] | undefined {
+  if (typeof item !== "object" || item === null) return undefined;
+  const record = item as BookmarkItem;
+  return record.type === "group" && Array.isArray(record.items) ? record.items : undefined;
+}
+
+function collectPaths(items: readonly unknown[]): string[] {
   const output: string[] = [];
   for (const item of items) {
-    if (item.type === "file" && typeof item.path === "string") output.push(item.path);
-    if (item.type === "group" && Array.isArray(item.items)) {
-      output.push(...collectPaths(item.items as BookmarkItem[]));
-    }
+    if (typeof item !== "object" || item === null) continue;
+    const record = item as BookmarkItem;
+    if (record.type === "file" && typeof record.path === "string") output.push(record.path);
+    const children = groupItems(item);
+    if (children !== undefined) output.push(...collectPaths(children));
   }
   return output;
 }
 
-function removePath(items: BookmarkItem[], notePath: string): void {
+function removePath(items: unknown[], notePath: string): void {
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
-    if (item === undefined) continue;
-    if (item.type === "file" && item.path === notePath) {
+    if (typeof item !== "object" || item === null) continue;
+    const record = item as BookmarkItem;
+    if (record.type === "file" && record.path === notePath) {
       items.splice(index, 1);
-    } else if (item.type === "group" && Array.isArray(item.items)) {
-      removePath(item.items as BookmarkItem[], notePath);
+    } else if (record.type === "group" && Array.isArray(record.items)) {
+      removePath(record.items, notePath);
     }
   }
 }

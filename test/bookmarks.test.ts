@@ -73,6 +73,85 @@ test("missing note and malformed file are rejected", async () => {
   });
 });
 
+test(".obsidian or bookmarks.json as a symlink is rejected without reading the target", async () => {
+  const linkedFile = await setup();
+  const outside = path.join(path.dirname(linkedFile.file), "..", "outside.json");
+  await fs.writeFile(outside, JSON.stringify({ items: [{ type: "file", path: "Secret.md" }] }));
+  await fs.symlink(outside, linkedFile.file);
+  await assert.rejects(linkedFile.tool.execute({ operation: "list", vault: "test" }, ctx()), {
+    code: "SYMLINK_NOT_ALLOWED"
+  });
+
+  const linkedDirectory = await setup();
+  const realConfig = path.join(path.dirname(linkedDirectory.file), "..", "real-config");
+  await fs.rename(path.dirname(linkedDirectory.file), realConfig);
+  await fs.symlink(realConfig, path.dirname(linkedDirectory.file));
+  await assert.rejects(
+    linkedDirectory.tool.execute({ operation: "add", vault: "test", path: "Notes/A.md" }, ctx()),
+    { code: "SYMLINK_NOT_ALLOWED" }
+  );
+});
+
+test("missing .obsidian directory gives an actionable error", async () => {
+  const { tool, file } = await setup();
+  await fs.rm(path.dirname(file), { recursive: true });
+  await assert.rejects(tool.execute({ operation: "list", vault: "test" }, ctx()), {
+    code: "NOTE_NOT_FOUND"
+  });
+});
+
+test("oversized files and over-nested groups are rejected", async () => {
+  const big = await setup();
+  await fs.writeFile(big.file, " ".repeat(5 * 1024 * 1024 + 1));
+  await assert.rejects(big.tool.execute({ operation: "list", vault: "test" }, ctx()), {
+    code: "INPUT_TOO_LARGE"
+  });
+
+  let nested: Record<string, unknown> = { type: "file", path: "Notes/A.md" };
+  for (let depth = 0; depth < 40; depth += 1) {
+    nested = { type: "group", title: "g", items: [nested] };
+  }
+  const deep = await setup({ items: [nested] });
+  await assert.rejects(deep.tool.execute({ operation: "list", vault: "test" }, ctx()), {
+    code: "INVALID_ARGUMENT"
+  });
+});
+
+test("if_match guards against stale revisions", async () => {
+  const { tool } = await setup();
+  const first = await tool.execute({ operation: "add", vault: "test", path: "Notes/A.md" }, ctx());
+  assert.match(first.etag ?? "", /^[a-f0-9]{64}$/u);
+  await assert.rejects(
+    tool.execute(
+      { operation: "add", vault: "test", path: "Notes/B.md", if_match: "0".repeat(64) },
+      ctx()
+    ),
+    { code: "REVISION_CONFLICT" }
+  );
+  const second = await tool.execute(
+    { operation: "add", vault: "test", path: "Notes/B.md", if_match: first.etag ?? "" },
+    ctx()
+  );
+  assert.equal(second.changed, true);
+  const fresh = await setup();
+  await assert.rejects(
+    fresh.tool.execute(
+      { operation: "add", vault: "test", path: "Notes/A.md", if_match: "0".repeat(64) },
+      ctx()
+    ),
+    { code: "REVISION_CONFLICT" }
+  );
+});
+
+test("note paths cannot escape the vault or target reserved roots", async () => {
+  const { tool } = await setup();
+  for (const bad of ["../x.md", "/etc/passwd", ".obsidian/bookmarks.json", "Notes/../../x.md"]) {
+    await assert.rejects(tool.execute({ operation: "add", vault: "test", path: bad }, ctx()), {
+      code: "PATH_REJECTED"
+    });
+  }
+});
+
 function ctx() {
   return { signal: new AbortController().signal };
 }
